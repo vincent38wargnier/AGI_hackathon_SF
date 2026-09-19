@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Live Voice Prototype</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body data-voice-state="idle">
+    <main class="app-shell">
+      <section class="voice-screen" aria-label="Live voice chat">
+        <header class="voice-topbar">
+          <details class="top-menu">
+            <summary aria-label="Open session menu">
+              <span></span>
+              <span></span>
+            </summary>
+            <div class="top-popover">
+              <label class="toggle"><input id="webToggle" type="checkbox" /> Public web search</label>
+              <a href="#transcriptPanel">Transcript</a>
+              <a href="#diagnostics">Diagnostics</a>
+            </div>
+          </details>
+
+          <div class="session-dot" aria-hidden="true"></div>
+
+          <details class="top-menu settings-menu">
+            <summary aria-label="Open provider settings">
+              <span class="slider-line"></span>
+              <span class="slider-line"></span>
+            </summary>
+            <div class="top-popover provider-popover">
+              <div class="config" id="config">Loading provider config...</div>
+              <div class="segmented" role="group" aria-label="Scheduling mode">
+                <button id="liveMode" class="selected">Live scheduling</button>
+                <button id="seqMode">Sequential baseline</button>
+              </div>
+            </div>
+          </details>
+        </header>
+
+        <div class="voice-stage">
+          <div class="orb-wrap" aria-hidden="true">
+            <div class="voice-orb">
+              <span class="orb-haze"></span>
+              <span class="orb-sheen"></span>
+            </div>
+          </div>
+
+          <div class="voice-status" aria-live="polite">
+            <p id="voiceStatusText">Ready when you are</p>
+            <dl class="status-strip" aria-label="Runtime status">
+              <div><dt>Connection</dt><dd id="floor">awaiting_user</dd></div>
+              <div><dt>Listening</dt><dd id="partial" class="partial">None yet</dd></div>
+              <div><dt>Heard</dt><dd id="final">None yet</dd></div>
+            </dl>
+          </div>
+        </div>
+
+        <aside id="activityPanel" class="activity-panel" data-open="true">
+          <button id="activityToggle" class="activity-head" type="button" aria-expanded="true" aria-controls="activityBody">
+            <span class="activity-title">Live activity</span>
+            <span id="activityHint" class="activity-hint">waiting for the session</span>
+            <span class="activity-chevron" aria-hidden="true"></span>
+          </button>
+          <div id="activityBody" class="activity-body">
+            <p id="activityHearing" class="activity-hearing" hidden></p>
+            <ol id="activityFeed" class="activity-feed" role="log" aria-label="Live activity feed"></ol>
+          </div>
+        </aside>
+
+        <div class="bottom-dock" aria-label="Message and voice controls">
+          <form id="typedForm" class="composer">
+            <label class="sr-only" for="typedInput">Message</label>
+            <div class="composer-field">
+              <span aria-hidden="true" class="plus-mark">+</span>
+              <input id="typedInput" autocomplete="off" placeholder="Ask by text..." />
+              <button type="submit" class="send-button" aria-label="Send typed message">Send</button>
+            </div>
+          </form>
+          <button id="startBtn" class="round-button mic-button" type="button" aria-pressed="false" aria-label="Start voice">
+            <span aria-hidden="true" class="mic-icon"></span>
+          </button>
+          <button id="interruptBtn" class="round-button interrupt-button" type="button" aria-label="Interrupt playback">
+            <span aria-hidden="true">■</span>
+          </button>
+          <button id="stopBtn" class="round-button end-button" type="button" aria-label="End session">×</button>
+        </div>
+      </section>
+
+      <section class="below-voice" aria-label="Conversation and diagnostics">
+        <details id="transcriptPanel" class="panel transcript-panel">
+          <summary>
+            <span>Text transcript</span>
+            <span>Secondary view</span>
+          </summary>
+          <ul id="conversation" class="list conversation" aria-live="polite"></ul>
+        </details>
+
+        <section id="diagnostics" class="diagnostics" aria-label="Engineering diagnostics">
+          <details class="panel data-panel">
+            <summary><span>Sources and jobs</span><span id="versions">v0</span></summary>
+            <div class="columns">
+              <div>
+                <h3>Jobs</h3>
+                <ul id="jobs" class="list"></ul>
+              </div>
+              <div>
+                <h3>Evidence</h3>
+                <ul id="evidence" class="list evidence"></ul>
+              </div>
+            </div>
+          </details>
+
+          <details class="panel speech-panel">
+            <summary><span>Speech ledger</span><span>heard state, not queued text</span></summary>
+            <ul id="speech" class="list speech"></ul>
+          </details>
+
+          <details class="panel metrics-panel">
+            <summary><span>Latency</span><span>monotonic clocks kept separate</span></summary>
+            <dl id="metrics" class="metrics"></dl>
+          </details>
+
+          <details class="panel controls">
+            <summary><span>Provider settings and baseline controls</span><span>research and trace tools</span></summary>
+            <div class="button-row">
+              <button id="finishTurnBtn" type="button">Finish voice turn</button>
+              <button id="refreshRagBtn" type="button">Refresh local docs</button>
+              <a class="button-link" href="/api/trace" target="_blank" rel="noreferrer">Export JSON trace</a>
+            </div>
+            <p class="hint">Voice path keeps the mic open, detects speech locally for barge-in, streams PCM to OpenAI realtime transcription, and acknowledges actual browser playback.</p>
+          </details>
+
+          <details class="panel timeline-panel">
+            <summary><span>Event timeline</span><span id="clock"></span></summary>
+            <ol id="timeline" class="timeline"></ol>
+          </details>
+        </section>
+      </section>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
