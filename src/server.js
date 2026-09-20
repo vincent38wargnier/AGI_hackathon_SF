@@ -21,6 +21,10 @@ const execFileAsync = promisify(execFile);
 
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.resolve(process.cwd(), "public")));
+// files built by ask_claude (Boson-bridge /files/ convention); auth handled by
+// the gate proxy in front, path containment by express.static
+fs.mkdirSync(config.claudeScratchDir, { recursive: true });
+app.use("/files", express.static(config.claudeScratchDir));
 
 app.get("/api/config", (_req, res) => res.json(publicProviderConfig()));
 app.get("/api/state", (_req, res) => res.json(runtime.view()));
@@ -169,14 +173,18 @@ function startRealtime(ws, payload) {
   }
   runtime.beginActiveSession();
 
-  const url = "wss://api.openai.com/v1/realtime?intent=transcription";
+  const useGradiumStt = config.sttProvider === "gradium" && config.gradiumApiKey;
+  const url = useGradiumStt
+    ? `${config.gradiumBase}/api/speech/asr`
+    : "wss://api.openai.com/v1/realtime?intent=transcription";
   const upstream = new WebSocket(url, {
-    headers: {
-      Authorization: `Bearer ${config.openaiApiKey}`,
-    },
+    headers: useGradiumStt
+      ? { "x-api-key": config.gradiumApiKey }
+      : { Authorization: `Bearer ${config.openaiApiKey}` },
   });
 	  const record = {
 	    upstream,
+	    provider: useGradiumStt ? "gradium" : "openai",
 	    sessionId: payload.sessionId,
 	    committed: false,
 	    openedAt: Date.now(),
@@ -192,6 +200,23 @@ function startRealtime(ws, payload) {
   runtime.event("transcription", "OpenAI realtime transcription connecting", { model: config.realtimeTranscribeModel });
 
   upstream.on("open", () => {
+    if (useGradiumStt) {
+      upstream.send(JSON.stringify({
+        type: "setup",
+        model_name: "default",
+        input_format: "pcm",
+        json_config: { language: config.gradiumSttLanguage, delay_in_frames: config.gradiumSttDelayFrames },
+      }));
+      runtime.event("transcription", "Gradium realtime transcription connected", { model: "gradium-default", language: config.gradiumSttLanguage });
+      for (const audio of record.pendingAudio.splice(0)) {
+        upstream.send(JSON.stringify({ type: "audio", audio }));
+      }
+      if (record.committed) {
+        upstream.send(JSON.stringify({ type: "flush", flush_id: 1 }));
+        upstream.send(JSON.stringify({ type: "end_of_stream" }));
+      }
+      return;
+    }
     upstream.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -237,7 +262,9 @@ function appendRealtimeAudio(ws, payload) {
     return;
   }
   if (record.upstream.readyState === WebSocket.OPEN) {
-    record.upstream.send(JSON.stringify({ type: "input_audio_buffer.append", audio: payload.audio }));
+    record.upstream.send(JSON.stringify(record.provider === "gradium"
+      ? { type: "audio", audio: payload.audio }
+      : { type: "input_audio_buffer.append", audio: payload.audio }));
   } else {
     record.pendingAudio.push(payload.audio);
     if (record.pendingAudio.length > record.pendingAudioLimit) record.pendingAudio.shift();
@@ -281,7 +308,15 @@ function commitRealtimeAudio(ws, payload) {
     }
   }
   if (record.upstream.readyState === WebSocket.OPEN) {
-    record.upstream.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+    if (record.provider === "gradium") {
+      // trailing silence helps the model finalize the last words, then flush+eos
+      const silence = Buffer.alloc(3840).toString("base64");
+      for (let i = 0; i < 6; i += 1) record.upstream.send(JSON.stringify({ type: "audio", audio: silence }));
+      record.upstream.send(JSON.stringify({ type: "flush", flush_id: 1 }));
+      record.upstream.send(JSON.stringify({ type: "end_of_stream" }));
+    } else {
+      record.upstream.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+    }
   }
 }
 
@@ -293,6 +328,41 @@ function handleRealtimeEvent(ws, data) {
     event = JSON.parse(data.toString());
   } catch {
     return;
+  }
+  if (record.provider === "gradium") {
+    if (event.type === "error") {
+      runtime.event("error", "Gradium transcription error", { code: event.code, message: String(event.message || "").slice(0, 200) });
+      return;
+    }
+    if (event.type === "text" && event.text) {
+      const segment = String(event.text);
+      record.partialTranscript = `${record.partialTranscript} ${segment}`.replace(/\s+([?.!,;:])/g, "$1").replace(/\s+/g, " ").trim();
+      if (!record.committed) {
+        record.interimSeq += 1;
+        runtime.event("transcription", `Realtime transcript delta #${record.interimSeq}`, { delta: segment.trim(), text: record.partialTranscript });
+        runtime.receiveTranscript({ text: record.partialTranscript, status: "interim", source: "voice-gradium-realtime" });
+      }
+      return;
+    }
+    if (event.type === "flushed" || event.type === "end_of_stream") {
+      if (record.finalized) return;
+      record.finalized = true;
+      const text = String(record.partialTranscript || "").trim();
+      const finalizedAt = Date.now();
+      runtime.event("transcription", "Realtime transcription finalized", {
+        text,
+        elapsedMs: finalizedAt - record.openedAt,
+        commitToFinalMs: record.committedAt ? finalizedAt - record.committedAt : null,
+        model: "gradium-default",
+      });
+      if (text && materialTranscriptChange(record.optimisticFinal, text)) {
+        runtime.event("transcription", "Provider final materially corrected optimistic transcript", { optimistic: record.optimisticFinal, final: text });
+        runtime.receiveTranscript({ text, status: "final_turn", source: "voice-gradium-realtime", turnId: record.optimisticTurnId });
+      }
+      closeRealtime(ws, "turn finalized");
+      return;
+    }
+    return; // ready/step and other Gradium messages are informational
   }
   if (event.type === "error") {
     runtime.event("error", "Realtime transcription provider error", { error: event.error });

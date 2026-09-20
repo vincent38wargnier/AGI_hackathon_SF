@@ -768,7 +768,8 @@ function feedPush(kind, html, at) {
   if (kind === "turn-user" || kind === "turn-assistant") {
     li.className = "feed-turn";
     li.dataset.role = kind === "turn-user" ? "user" : "assistant";
-    li.innerHTML = `<span class="feed-time">${feedNow(at)}</span><span class="feed-text"><span class="feed-speaker">${kind === "turn-user" ? "You:" : "Agent:"}</span>${html}</span>`;
+    const linked = html.replace(/(\/files\/[\w\-./%]+)/g, '<a href="$1" target="_blank" rel="noreferrer">$1</a>');
+    li.innerHTML = `<span class="feed-time">${feedNow(at)}</span><span class="feed-text"><span class="feed-speaker">${kind === "turn-user" ? "You:" : "Agent:"}</span>${linked}</span>`;
   } else {
     li.className = kind === "error" ? "feed-error" : kind === "warn" ? "feed-warn" : "";
     li.innerHTML = `<span class="feed-time">${feedNow(at)}</span><span class="feed-text">${html}</span>`;
@@ -799,12 +800,18 @@ function feedIngest(e) {
   if (/^Communicator respond completed/.test(L)) return feedPush("event", `Decision ready in ${d.elapsedMs ?? "?"} ms`, e.at);
   if (/^Communicator plan completed/.test(L)) return feedPush("event", `Plan ready in ${d.elapsedMs ?? "?"} ms`, e.at);
   if (/aborted for newer input/.test(L)) return feedPush("event", "Superseded by new speech", e.at);
+  if (/^claude_task search running/.test(L)) return feedPush("event", `Claude: building — “${q(d.query, 90)}”`, e.at);
+  if (/^claude_task search completed/.test(L)) return feedPush("event", `Claude: done (${Math.round((d.durationMs ?? 0) / 1000)}s)`, e.at);
+  if (/^Work follow-up queued/.test(L)) return feedPush("event", `Claude: noted — will fold into the running build`, e.at);
+  if (/^Starting queued work follow-up/.test(L)) return feedPush("event", `Claude: sending your accumulated changes…`, e.at);
+  if (/^Duplicate work request suppressed/.test(L)) return feedPush("event", "Claude: already building that", e.at);
   if (/^local_rag search running/.test(L)) return feedPush("event", `Searching local notes: “${q(d.query)}”`, e.at);
   if (/^web search running/.test(L)) return feedPush("event", `Searching the web: “${q(d.query)}”`, e.at);
   if (/^(local_rag|web) search completed/.test(L)) return feedPush("event", `Search done — ${d.resultCount ?? 0} results (${d.durationMs ?? "?"} ms)`, e.at);
   if (/bridge released/.test(L)) return feedPush("event", `Bridge: “${q(d.text)}”`, e.at);
   if (/^Speech drafted/.test(L)) return feedPush("event", `Reply ready: “${q(d.text)}”`, e.at);
-  if (/^Browser started actual playback/.test(L)) return feedPush("event", "Speaking…", e.at);
+  if (/^Browser started actual playback/.test(L)) return feedPush("event", feedCfg?.ttsProvider === "gradium" ? "Speaking (gradium)…" : "Speaking…", e.at);
+  if (/^Gradium realtime transcription connected/.test(L)) return feedPush("event", "Mic link ready (gradium)", e.at);
   if (/^OpenAI realtime transcription connected/.test(L)) return feedPush("event", "Mic link ready", e.at);
   if (/reaped/.test(L)) return feedPush("warn", "Recovered a stuck playback", e.at);
 }

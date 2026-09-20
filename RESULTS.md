@@ -100,7 +100,7 @@ Proof:
 - Unit tests still pass (`node --test test/runtime-speaking-layer.test.mjs`, fail 0).
 - Deterministic repro (`repro-stall.mjs`): withheld `/api/played` after turn 1, sent turn 2 → previously stuck forever; with fix, reaped at 17 s and answered.
 - LIVE through the tunnel (`live-qa-mic.mjs`, real Chrome + fake-audio-capture wav speaking "what is two plus two?"): STT final → gpt-oss-120b respond 448 ms → spoken reply played. Second session even hit the exact bug live (previous browser vanished mid-playback) and recovered instantly: "Stale playback confirmation reaped (ageMs 37974)". Screenshot: `shots-live/05-mic-turn-completes.png`; timeline: `live-mic-timeline.txt`.
-- App restarted on the same port/env; the authenticated proxy in front of the preview deployment was untouched and re-verified.
+- App restarted on the same port/env; the authenticated proxy in front of the public tunnel was untouched (unauthenticated requests still 403, authenticated entry still works).
 
 ## Semantic endpointer (2026-09-19 22:xx): mid-thought pauses no longer steal the turn
 
@@ -172,10 +172,62 @@ Proof, live through the tunnel with a French-accented "Yeah, I, I want [3.5 s pa
 - Complete sentences still fast: COMPLETE in 495/543 ms (`13b-complete-still-fast.png`).
 - Live classifier latencies before/after: before-fix session had 3 hard timeouts committing fragments; post-fix runs measured 361-543 ms (median 456) with the one slow call absorbed by the heuristic hold. Unit tests 66/66 (also fixed a `localStorage` guard the feed toggle needed for the test harness/Safari private mode).
 
-## Files
+## Gradium integration (2026-09-20 ~00:55): sponsor voice (TTS) + candidate ears (STT)
 
-- Diff: `voice-agent/src/config.js`, `voice-agent/src/openaiProvider.js` (`git diff` inside the clone; not committed/pushed)
-- Benches: `smoke-gc.mjs`, `bench-nonstream.mjs`, `bridge-race.mjs` (+ `*.json` outputs)
-- A/B: `ab-driver.mjs`, `ab-analyze.mjs`, `ab-openai.json`, `ab-gc.json`, `ab-metrics.json`, `server-{openai,gc}.log`
-- QA: `qa-browser.mjs`, `qa-browser-timeline.txt`, `shots/`
-- Run it: `BRAIN_PROVIDER=gc GC_API_KEY=... OPENAI_API_KEY=... SEMANTIC_ENDPOINT=on node src/server.js`
+Key supplied via env var (`GRADIUM_API_KEY`), never committed or logged. Protocol per Gradium's docs. Working base: `wss://us.api.gradium.ai`, auth `x-api-key`, JSON WS wire (setup → ready → text/audio → flush/eos).
+
+### Smoke (this Mac, `smoke-gradium.mjs` / `smoke-gradium-results.json`)
+- TTS: **time-to-first-audio 270-287 ms warm** (509 ms cold), 48 kHz s16le PCM out, full sentence in ~2.5 s.
+- STT (language `any`, delay_in_frames 16): **100% word accuracy on all 8 bench wavs** — French-accented English AND the French sentence, "SaaS" correct with zero prompt hints; finalize 810-1643 ms after audio end.
+
+### What was swapped
+- TTS behind `TTS_PROVIDER=gradium|openai` (default openai): dispatcher + `gradiumStreamSpeech()` WS client in `src/openaiProvider.js` (~:500, same handler contract + `sampleRate` in payloads); runtime sample-rate plumbing so 48 kHz flows to the browser player (`src/sessionRuntime.js`: cache entries store `sampleRate`, `populatePreparedFromCache`/`emitCachedAudio`/`streamUnitAudioAttempt` set `audioSampleRate`/`audioMime` from the provider; client already honored `event.sampleRate`). No resampling needed anywhere.
+- STT behind `STT_PROVIDER=gradium|openai` (default openai): Gradium ASR branch in `src/server.js` `startRealtime`/`appendRealtimeAudio`/`commitRealtimeAudio`/`handleRealtimeEvent` — browser 24 kHz PCM passes straight through; `text` segments → interim pipeline; browser-VAD commit → trailing silence + `flush` + `end_of_stream` → final. Our semantic endpointer stays the turn decider (Gradium `step` VAD left informational — no double-classifying).
+- Config: `src/config.js` gradium block; feed shows "Speaking (gradium)…" / "Mic link ready (gradium)".
+
+### STT A/B verdict (data)
+| config | clean 8-wav accuracy | degraded (noise+8k) |
+|---|---|---|
+| OpenAI gpt-live-transcribe + domain prompt (deployed) | 100% | 96% |
+| Gradium ASR, language=any, NO hints | **100%** | 91% raw (≈96% normalized: "2 plus 2" vs "two plus two" digit-scoring, "users"/"prices" word slips) |
+
+Effectively a tie on accuracy. **Kept OpenAI as deployed STT** because its word-level partial deltas feed plan-mode and optimistic-finalize tighter than Gradium's ~1.3 s segment cadence (delay_in_frames 16), which would weaken plan-ahead; Gradium ears remain one env flip away (`STT_PROVIDER=gradium`) and its clean-set showing (100% with zero hints, native FR) makes it the candidate if OpenAI realtime degrades.
+
+### Live (tunnel, mic, GC brain + endpointer on, `TTS_PROVIDER=gradium`)
+- Fresh uncached turn: turn-end → first TTS audio **1,271 ms**, browser playback at **1,307 ms** — decomposed: endpointer classify 304 ms + GC respond 850 ms + Gradium first chunk ≈ 250-300 ms. Warm-cached answers play at ~135 ms.
+- TTS engine like-for-like: OpenAI gpt-4o-mini-tts first chunk across today's traces 454-975 ms (median ≈ 700 ms) → Gradium ≈ **280 ms** (−400 ms on every spoken reply, incl. bridge acks and backchannels).
+- Browser plays the 48 kHz stream cleanly (0 console errors); feed shows "Speaking (gradium)…". Screenshot: `shots-live/14-gradium-tts-live.png` (full arc: You → Endpointer 304 ms → Thinking → Decision 850 ms → Speaking (gradium) → moonquake answer). STT A/B table above = shot 15 equivalent.
+- Deployed config on 4795: BRAIN=gc(gpt-oss-120b) + SEMANTIC_ENDPOINT=on + TTS_PROVIDER=gradium + STT=openai. GC brain untouched; unit tests 66/66.
+
+### TTS smoke re-verified with on-disk artifacts (phase-2 leg, 2026-09-20 ~01:15)
+The original TTS smoke numbers were console-only (the json kept just the STT rows). Re-run, same sentence both providers, saved to `tts-compare.json` + `smoke-gradium-rerun.log`:
+- Gradium WS (48 kHz PCM): time-to-first-audio **270 / 305 / 320 ms** after text send (connect+ready ≈ 330 ms, once per utterance).
+- OpenAI gpt-4o-mini-tts raw fetch (24 kHz PCM): TTFB **377 / 489 / 889 ms**.
+- Gradium STT smoke also re-run: **MEAN accuracy 100%** on the 8 bench wavs again.
+
+## ask_claude — yesterday's Boson-bridge demo, ported into this agent (2026-09-20 ~01:15)
+
+Voice-request a build → instant spoken ack + the agent keeps chatting → Claude Code builds it detached → the result is spoken with a `/files/` link and the page is served through the tunnel; corrections spoken mid-build are absorbed and land as ONE follow-up edit.
+
+### What was built (reusing battle-tested bridge logic from an earlier Claude-bridge project)
+- `src/claudeEngine.js` (new, 91 lines) — `runClaudeTask()`: `claude -p --model claude-sonnet-4-6 --dangerously-skip-permissions --append-system-prompt <audio-mode + /files/ contract>` (binary via `CLAUDE_BIN`), cwd = `claude-tasks/scratch/`, `--continue` first (edit-in-place session continuity, the bridge trick) with plain-run fallback, 240 s timeout, CLAUDE*/ANTHROPIC* env stripped from the child, never throws — failures come back as speakable text. Log: `claude-tasks/engine.log`.
+- `src/openaiProvider.js:132` — new brain tool `ask_claude` in `communicate()`'s toolset; `:204-208` system-prompt doctrine (delegate builds immediately + ack with ONE detail question, never duplicate a running build, consolidate corrections); `:368-369` maps the tool call to a `start_search` action with `source: "claude_task"`.
+- `src/sessionRuntime.js` — ledger semantics ported intact: `:1040-1055` single-flight per topic (a second ask_claude while one runs → Jaccard ≥ 0.8 = "Duplicate work request suppressed", else absorbed into `pendingClaudeTask` with `"; also:"`), `:1201-1205` exactly ONE enriched follow-up fired on completion, `:1251` claude_task jobs exempt from obsolete-job cancellation. Delivery rides the existing async-job → evidence → `wakeup("respond")` flow, so the agent speaks the result naturally.
+- `src/server.js:24-27` — `/files/` static route on the scratch dir (bridge publishing convention; the deployment's auth proxy covers it through the tunnel).
+- `public/app.js:803-807` — feed lifecycle: "Claude: building — …", "Claude: done (77s)", "Claude: noted — will fold into the running build", "Claude: already building that", errors red.
+
+### Live proof (tunnel, real Chrome, fake-mic wavs `mic-coffee-request.wav` / `mic-coffee-correction.wav`; run log `askclaude-run.log`, timeline `askclaude-timeline.txt`, `claude-tasks/engine.log`)
+1. Voice: "Hey, can you build me a landing page for a coffee tasting club? It needs a signup form that collects email addresses." → heard verbatim, ack + detail question spoken ~4 s later ("Sure thing—what would you like to build?" … "Got it—building a coffee-tasting club landing page. Which email service should I connect the sign-up form to?"), feed shows "Claude: building — …". `shots-live/16-ask-claude-launched.png`.
+2. Build ran detached 77 s (engine.log 00:11:28 → 00:12:46 "Done. /files/coffeeclub.html") while the conversation stayed live.
+3. Mid-build voice correction: "Actually, make the background dark green and call the club the Roast Club." → feed "Claude: noted — will fold into the running build" (no second build started). `shots-live/18-correction-absorbed.png`. (The looping fake-mic wav re-spoke the correction ~14×; every re-hearing was absorbed into the same buffer — zero duplicate builds, exactly as designed.)
+4. On completion the runtime fired ONE consolidated follow-up (engine.log 00:12:46 "Update the coffee tasting club landing page: set the background color to dark green and change the club name to Roast Club…") — an edit-in-place via `--continue`, done in 19 s.
+5. Delivery spoken with the link (session trace 00:13:06): "Done—background is dark green and the name is now the Roast Club (see /files/coffeeclub.html)…" — Gradium TTS, first audio 485 ms. Feed delivery line captured live in a follow-on session: `shots-live/19-delivery-spoken-in-feed.png`.
+6. The page itself through the tunnel: `shots-live/17-ask-claude-page-live.png` — dark forest green (rgb 10,31,14), "The Roast Club" branding, email signup form: BOTH spoken corrections applied. `/files/` sits behind the deployment's auth proxy (403 without).
+
+### Known gap (honest)
+Twice during QA, a longer-lived tunneled session's app WS silently stopped receiving events (~75-110 s after connect, both times right at/after a Gradium audio broadcast burst: 00:12:47 and 00:16:41). No close frame ever reached the page, so the WS-reconnect logic (which fires on onclose) never triggered, and the proxy log shows no re-upgrade attempt. The server kept working perfectly each time — builds, the follow-up, and the spoken delivery all completed (trace + engine.log) — but the frozen page missed them. Delivery WAS captured in-browser in a fresh session (`19-delivery-spoken-in-feed.png`: Claude done (23s) → Reply ready "…/files/coffeebrewtips.html" → Speaking (gradium)). Fix direction: WS keepalive ping/pong + staleness watchdog in `public/app.js`/`src/server.js`; not applied now to avoid destabilizing the proven stack right at delivery.
+
+- Benches: `smoke-gc.mjs`, `bench-nonstream.mjs`, `bridge-race.mjs` (+ `*.json` outputs) — private working dir
+- A/B: `ab-driver.mjs`, `ab-analyze.mjs`, `ab-openai.json`, `ab-gc.json`, `ab-metrics.json` — private working dir
+- QA: `qa-browser.mjs`, `qa-browser-timeline.txt`, `shots/`, `shots-live/` — private working dir
+- Run it: `BRAIN_PROVIDER=gc TTS_PROVIDER=gradium SEMANTIC_ENDPOINT=on node src/server.js` with `OPENAI_API_KEY`, `GC_API_KEY`, `GRADIUM_API_KEY` set as env vars

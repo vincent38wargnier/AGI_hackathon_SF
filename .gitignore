@@ -5,6 +5,7 @@ node_modules/
 artifacts/
 private-traces/
 files/
+claude-tasks/
 *.log
 *.pid
 *.wav

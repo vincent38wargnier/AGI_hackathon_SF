@@ -4,6 +4,7 @@ import path from "node:path";
 import { nanoid } from "nanoid";
 import { communicate, decideBridgeAcknowledgement, streamSpeech, webSearch, classifyTurnCompletion, semanticEndpointAvailable } from "./openaiProvider.js";
 import { config } from "./config.js";
+import { runClaudeTask } from "./claudeEngine.js";
 import { searchCorpus } from "./corpus.js";
 import { searchRag, refreshIndex, listDocuments } from "./ragStore.js";
 import { makeTimelineEvent, nowMs } from "./telemetry.js";
@@ -19,6 +20,15 @@ const UNPLAYED_SPEECH_STALE_MS = 30000;
 const PLAYBACK_STALL_RETRY_MS = 3000;
 const PCM_BYTES_PER_MS = 48; // 24kHz 16-bit mono
 
+function wordSetJaccard(a, b) {
+  const norm = (t) => String(t || "").toLowerCase().replace(/[^a-z0-9 ]+/g, "").split(/\s+/).filter(Boolean);
+  const A = new Set(norm(a));
+  const B = new Set(norm(b));
+  let n = 0;
+  for (const w of A) if (B.has(w)) n += 1;
+  return n / Math.max(A.size, B.size, 1);
+}
+
 export class SessionRuntime extends EventEmitter {
   constructor({ communicateFn = communicate, bridgeDecisionFn = decideBridgeAcknowledgement, endpointClassifierFn = classifyTurnCompletion } = {}) {
     super();
@@ -28,6 +38,7 @@ export class SessionRuntime extends EventEmitter {
     this.classifyTurnCompletion = endpointClassifierFn;
     this.endpointHold = null;
     this.endpointClassCache = new Map();
+    this.pendingClaudeTask = null;
     this.lastEndpointWarm = 0;
     this.state = {
       sessionId: nanoid(),
@@ -627,7 +638,7 @@ export class SessionRuntime extends EventEmitter {
     const inputMoved = ctx.inputVersion !== this.state.inputVersion;
     let startedSearch = false;
     for (const action of decision.actions || []) {
-      if (action.type === "start_search" && (!inputMoved || this.isQueryCompatible(action.query))) {
+      if (action.type === "start_search" && (!inputMoved || action.source === "claude_task" || this.isQueryCompatible(action.query))) {
         this.startSearch(action.source, action.query, Boolean(action.required), { ...ctx, inputVersion: this.state.inputVersion, originalInputVersion: ctx.inputVersion, toolCallId: action.toolCallId });
         startedSearch = true;
       } else if (action.type === "start_search") {
@@ -1026,7 +1037,23 @@ export class SessionRuntime extends EventEmitter {
       this.event("job", "Duplicate search deduped", { source, query, existing: existing.id });
       return existing.id;
     }
-	    const localRunning = [...this.state.jobs.values()].filter((j) => ["scheduled", "running"].includes(j.status) && j.source !== "web").length;
+	    if (source === "claude_task") {
+	      const runningWork = [...this.state.jobs.values()].find((j) => j.source === "claude_task" && ["scheduled", "running"].includes(j.status));
+	      if (runningWork) {
+	        const sim = wordSetJaccard(runningWork.query, query);
+	        if (sim >= 0.8) {
+	          this.event("job", "Duplicate work request suppressed (already building)", { query: query.slice(0, 120), similarity: Math.round(sim * 100) / 100 });
+	          return runningWork.id;
+	        }
+	        this.pendingClaudeTask = this.pendingClaudeTask
+	          ? `${this.pendingClaudeTask}; also: ${query}`
+	          : query;
+	        this.event("job", "Work follow-up queued while build runs", { query: query.slice(0, 140) });
+	        this.emitState();
+	        return null;
+	      }
+	    }
+	    const localRunning = [...this.state.jobs.values()].filter((j) => ["scheduled", "running"].includes(j.status) && j.source !== "web" && j.source !== "claude_task").length;
 	    const webRunning = [...this.state.jobs.values()].filter((j) => ["scheduled", "running"].includes(j.status) && j.source === "web").length;
     if (source !== "web" && localRunning >= 2) {
       this.event("job", "Search deferred by concurrency cap", { source, query });
@@ -1116,7 +1143,17 @@ export class SessionRuntime extends EventEmitter {
     try {
       await this.applyFault(job);
       let results = [];
-      if (job.source === "local_rag") results = await searchRag(job.query);
+      if (job.source === "claude_task") {
+        const work = await runClaudeTask(job.query);
+        job.model = work.model;
+        job.workFailed = work.failed;
+        results = [{
+          id: "work-1",
+          source: "work",
+          title: `Work result: ${job.query.slice(0, 90)}`,
+          content: String(work.text || "").slice(0, 2400),
+        }];
+      } else if (job.source === "local_rag") results = await searchRag(job.query);
       else if (job.source === "web") {
         const web = await webSearch(job.query);
         job.responseId = web.responseId;
@@ -1161,6 +1198,12 @@ export class SessionRuntime extends EventEmitter {
       this.state.knowledgeVersion += 1;
       this.event("job", `${job.source} search completed`, { jobId, resultCount: results.length, durationMs: job.durationMs });
       this.emitState();
+      if (job.source === "claude_task" && this.pendingClaudeTask) {
+        const queued = this.pendingClaudeTask;
+        this.pendingClaudeTask = null;
+        this.event("job", "Starting queued work follow-up", { query: queued.slice(0, 140) });
+        this.startSearch("claude_task", queued, false, { modelMode: "queued-followup" });
+      }
 	      this.clearBridgeAcknowledgement("research completed");
       if (this.state.floor !== "user_speaking" && this.shouldSpeakAfterResearch(job)) this.wakeup("respond");
     } catch (error) {
@@ -1186,6 +1229,7 @@ export class SessionRuntime extends EventEmitter {
 
   retireConflictingEvidence(job) {
     for (const ev of this.state.evidence.values()) {
+      if (ev.source === "work") continue;
       if (ev.originatingInputVersion < job.inputVersion && !this.isQueryCompatible(ev.retrievedForQuery || ev.content)) ev.state = "stale";
     }
   }
@@ -1194,6 +1238,7 @@ export class SessionRuntime extends EventEmitter {
     const currentTerms = terms(text);
     if (currentTerms.length < 5 || isShortFollowup(text)) return;
     for (const ev of this.state.evidence.values()) {
+      if (ev.source === "work") continue;
       const evTerms = terms(ev.retrievedForQuery || ev.content);
       if (evTerms.length && currentTerms.length) {
         const overlap = evTerms.filter((term) => currentTerms.includes(term)).length / evTerms.length;
@@ -1203,6 +1248,7 @@ export class SessionRuntime extends EventEmitter {
   }
 
   isJobStillRelevant(job) {
+    if (job.source === "claude_task") return true;
     if (job.inputVersion === this.state.inputVersion) return true;
     const current = this.state.provisionalTranscript || this.state.finalizedTranscript || "";
 	    if (isCompatibleTranscriptRevision(job.query, current)) return true;
@@ -1961,6 +2007,7 @@ export class SessionRuntime extends EventEmitter {
 	    entry.attempts += 1;
 	    this.audioWarmInFlight += 1;
 	    entry.promise = streamSpeech(entry.text, {
+	      onStart: ({ sampleRate }) => { entry.sampleRate = sampleRate || 24000; },
 	      onChunk: ({ chunk, chunkCount, bytes }) => {
 	        entry.chunks.push(chunk.toString("base64"));
 	        entry.chunkCount = chunkCount;
@@ -2008,8 +2055,8 @@ export class SessionRuntime extends EventEmitter {
 	    unit.ttsFirstChunkMonoMs = unit.ttsStartedMonoMs;
 	    unit.ttsElapsedMs = 0;
 	    unit.ttsModel = cached.model || "prewarmed";
-	    unit.audioMime = "audio/pcm;rate=24000";
-	    unit.audioSampleRate = 24000;
+	    unit.audioMime = `audio/pcm;rate=${cached.sampleRate || 24000}`;
+	    unit.audioSampleRate = cached.sampleRate || 24000;
 	    unit.audioEncoding = "s16le";
 	    unit.audioChannels = 1;
 	    unit.audioBytes = cached.bytes;
@@ -2032,8 +2079,8 @@ export class SessionRuntime extends EventEmitter {
 	    unit.ttsFirstChunkMonoMs = unit.ttsStartedMonoMs;
 	    unit.ttsElapsedMs = 0;
 	    unit.ttsModel = cached.model || "prewarmed";
-	    unit.audioMime = "audio/pcm;rate=24000";
-	    unit.audioSampleRate = 24000;
+	    unit.audioMime = `audio/pcm;rate=${cached.sampleRate || 24000}`;
+	    unit.audioSampleRate = cached.sampleRate || 24000;
 	    unit.audioEncoding = "s16le";
 	    unit.audioChannels = 1;
 	    unit.audioBytes = cached.bytes;
@@ -2080,9 +2127,13 @@ export class SessionRuntime extends EventEmitter {
 	    this.event("speech", prepared ? "Prepared TTS stream started" : "TTS stream started", { speechId: unit.id, attempt });
 	    let firstChunkTimer = null;
 	    await streamSpeech(unit.text, {
-      onStart: ({ controller, model }) => {
+      onStart: ({ controller, model, sampleRate }) => {
         this.ttsControllers.set(unit.id, controller);
         unit.ttsModel = model;
+        if (sampleRate && sampleRate !== unit.audioSampleRate) {
+          unit.audioSampleRate = sampleRate;
+          unit.audioMime = `audio/pcm;rate=${sampleRate}`;
+        }
 	        firstChunkTimer = setTimeout(() => {
 	          if (!unit.ttsFirstChunkMs && unit.status !== "cancelled") {
 	            unit.ttsFirstChunkTimedOut = true;

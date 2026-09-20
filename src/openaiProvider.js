@@ -126,6 +126,21 @@ const decisionTools = [
 	      },
 	    },
 	  },
+  {
+    type: "function",
+    function: {
+      name: "ask_claude",
+      description: "Delegate real work to Claude, a powerful agent with full machine and web access: build websites, pages, documents, code; deep multi-step research; run anything. Takes 10-90 seconds; the result arrives later as evidence (source work) including a /files/ link for anything built. Forward the user request faithfully with every detail given. Follow-ups, corrections, and edits to a running or finished build also go here.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          task: { type: "string", description: "The user request for Claude, complete with all details and context gathered so far." },
+        },
+        required: ["task"],
+      },
+    },
+  },
 	  {
 	    type: "function",
 	    function: {
@@ -186,6 +201,11 @@ Runtime rules:
 	- No invented rapport, benefits, urgency, customer facts, or pressure.
 	- Do not mention internal tool names, evidence IDs, filenames, or chunk IDs in speech.
 	- Do not say "cite", "source", "evidence ID", or instructions about evidence aloud. Put support in evidenceIds; the spoken text should sound natural.
+- Delegated work (ask_claude):
+	- When the user asks you to BUILD, create, make, write, or fix something concrete (a website, page, document, app, email longer than a sentence, code) or wants deep multi-step work done, call ask_claude in respond mode with the complete request immediately — do not interrogate first. In the same decision, also call final_response with a short natural acknowledgement plus ONE useful detail question (e.g. "On it — building that now. What should the page say at the top?"). Make reasonable assumptions; missing details get filled in later.
+	- While a work job is running (visible in pendingOptionalJobs as source claude_task), keep the conversation alive: acknowledge answers and ask the next single most useful detail question. Never say only "still working". Never start a duplicate ask_claude for the same request; corrections and new details about the running build should be sent as ONE consolidated ask_claude follow-up — the system queues it until the current build finishes.
+	- When evidence with source "work" is eligible and unspoken, speak its result now in one short sentence and include any /files/ path VERBATIM in the speech text (it renders as a clickable link). Never invent a /files/ path; only use paths that appear in work evidence.
+	- Follow-up edits after delivery ("make it darker", "change the title") go to ask_claude as-is; it remembers the ongoing work.
 - Evidence and research:
 	- Local RAG is synthetic local evidence. Web search is public evidence and may be used only when webEnabled is true.
 		- Do not use local RAG for ordinary personal support, grief, embarrassment, closure, repair, or generic email/message drafting. Answer those directly unless the user asks for business evidence or the request clearly concerns product/pricing/growth/support/customer-risk decisions.
@@ -345,6 +365,9 @@ function decisionFromToolCalls(toolCalls, mode) {
       decision.actions.push({ type: "start_search", source: "web", query: String(args.query), required: Boolean(args.required), toolCallId: call.id });
       if (args.required) decision.needsEvidence = true;
     }
+    if (name === "ask_claude" && args.task && mode !== "plan") {
+      decision.actions.push({ type: "start_search", source: "claude_task", query: String(args.task), required: false, toolCallId: call.id });
+    }
 	    if (name === "final_response" && mode !== "plan") {
 	      decision.speech = sanitizeSpeech(String(args.speech || ""));
 	      decision.evidenceIds = Array.isArray(args.evidenceIds) ? args.evidenceIds.map(String) : [];
@@ -475,6 +498,67 @@ export async function synthesizeSpeech(text) {
 }
 
 export async function streamSpeech(text, handlers = {}) {
+  if (config.ttsProvider === "gradium" && config.gradiumApiKey) return gradiumStreamSpeech(text, handlers);
+  return openaiStreamSpeech(text, handlers);
+}
+
+// Gradium streaming TTS over WS (48kHz s16le PCM out). Same handler contract
+// as the OpenAI path, plus sampleRate in onStart/onEnd payloads.
+async function gradiumStreamSpeech(text, handlers = {}) {
+  const { default: WebSocket } = await import("ws");
+  const started = Date.now();
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`${config.gradiumBase}/api/speech/tts`, { headers: { "x-api-key": config.gradiumApiKey } });
+    const controller = { abort: () => { aborted = true; try { ws.close(); } catch {} } };
+    let aborted = false;
+    let sampleRate = 48000;
+    let firstChunkMs = null;
+    let bytes = 0;
+    let chunkCount = 0;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      const elapsedMs = Date.now() - started;
+      handlers.onEnd?.({ elapsedMs, firstChunkMs, bytes, chunkCount, model: "gradium-default", sampleRate });
+      resolve({ elapsedMs, firstChunkMs, bytes, chunkCount, model: "gradium-default", sampleRate });
+    };
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      try { ws.close(); } catch {}
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const guard = setTimeout(() => (aborted ? finish() : fail(new Error("Gradium TTS timed out"))), 30000);
+    ws.on("open", () => {
+      const setup = { type: "setup", model_name: "default", output_format: "pcm" };
+      if (config.gradiumVoiceId) setup.voice_id = config.gradiumVoiceId;
+      ws.send(JSON.stringify(setup));
+      handlers.onStart?.({ model: "gradium-default", startedAtMs: started, controller, sampleRate });
+      ws.send(JSON.stringify({ type: "text", text: String(text || "") }));
+      ws.send(JSON.stringify({ type: "end_of_stream" }));
+    });
+    ws.on("message", (raw) => {
+      let msg;
+      try { msg = JSON.parse(raw.toString()); } catch { return; }
+      if (msg.type === "ready" && msg.sample_rate) sampleRate = msg.sample_rate;
+      if (msg.type === "audio" && msg.audio) {
+        if (aborted) return;
+        const buffer = Buffer.from(msg.audio, "base64");
+        bytes += buffer.length;
+        chunkCount += 1;
+        if (firstChunkMs === null) firstChunkMs = Date.now() - started;
+        handlers.onChunk?.({ chunk: buffer, chunkCount, bytes, elapsedMs: Date.now() - started, firstChunkMs });
+      }
+      if (msg.type === "error") { clearTimeout(guard); fail(new Error(`Gradium TTS ${msg.code}: ${String(msg.message).slice(0, 160)}`)); }
+      if (msg.type === "end_of_stream") { clearTimeout(guard); try { ws.close(); } catch {} finish(); }
+    });
+    ws.on("error", (error) => { clearTimeout(guard); if (aborted) finish(); else fail(error); });
+    ws.on("close", () => { clearTimeout(guard); if (aborted) finish(); });
+  });
+}
+
+async function openaiStreamSpeech(text, handlers = {}) {
   if (!config.openaiApiKey) throw new Error("OPENAI_API_KEY is not configured");
   const started = Date.now();
   const controller = new AbortController();
@@ -497,7 +581,7 @@ export async function streamSpeech(text, handlers = {}) {
     const body = await response.text().catch(() => "");
     throw new Error(`TTS stream failed ${response.status}: ${body.slice(0, 240)}`);
   }
-  handlers.onStart?.({ model: config.ttsModel, startedAtMs: started, controller });
+  handlers.onStart?.({ model: config.ttsModel, startedAtMs: started, controller, sampleRate: 24000 });
   let firstChunkMs = null;
   let bytes = 0;
   let chunkCount = 0;
@@ -516,6 +600,6 @@ export async function streamSpeech(text, handlers = {}) {
     });
   }
   const elapsedMs = Date.now() - started;
-  handlers.onEnd?.({ elapsedMs, firstChunkMs, bytes, chunkCount, model: config.ttsModel });
-  return { elapsedMs, firstChunkMs, bytes, chunkCount, model: config.ttsModel };
+  handlers.onEnd?.({ elapsedMs, firstChunkMs, bytes, chunkCount, model: config.ttsModel, sampleRate: 24000 });
+  return { elapsedMs, firstChunkMs, bytes, chunkCount, model: config.ttsModel, sampleRate: 24000 };
 }
